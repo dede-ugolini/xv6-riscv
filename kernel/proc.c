@@ -124,6 +124,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->tickets = 1;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -289,6 +290,9 @@ kfork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // the child inherits the parent's ticket count.
+  np->tickets = p->tickets;
+
   pid = np->pid;
 
   release(&np->lock);
@@ -425,6 +429,12 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+//
+// The selection is a lottery: each process holds tickets,
+// and a random ticket is drawn. A process wins with
+// probability proportional to its share of the tickets
+// among all RUNNABLE processes. This implements
+// proportional sharing of CPU time.
 void
 scheduler(void)
 {
@@ -432,6 +442,11 @@ scheduler(void)
   struct cpu *c = mycpu();
 
   c->proc = 0;
+
+  // Seed the per-CPU PRNG once.
+  if (c->randstate == 0)
+    c->randstate = r_time();
+
   for (;;) {
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
@@ -441,30 +456,56 @@ scheduler(void)
     intr_on();
     intr_off();
 
+    // Pass 1: sum the tickets of all RUNNABLE processes.
+    // Locks are taken and released one at a time, so the
+    // RUNNABLE set may drift between the passes; lottery
+    // scheduling tolerates this approximation.
+    int total = 0;
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE)
+        total += p->tickets;
+      release(&p->lock);
+    }
+
+    if (total == 0) {
+      // nothing to run; stop running on this core until an interrupt.
+      asm volatile("wfi");
+      continue;
+    }
+
+    // Draw a random ticket and find its owner. The low-order bits
+    // of an LCG are poorly distributed, so use the high-order bits.
+    c->randstate =
+        c->randstate * 6364136223846793005ULL + 1442695040888963407ULL;
+    int ticket = (c->randstate >> 32) % total;
+
+    int acc = 0;
     int found = 0;
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+        acc += p->tickets;
+        if (acc > ticket) {
+          // Switch to chosen process.  It is the process's job
+          // to release its lock and then reacquire it
+          // before jumping back to us.
+          p->state = RUNNING;
+          c->proc = p;
+          swtch(&c->context, &p->context);
 
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
+          // Don't re-enable interrupts on release.
+          mycpu()->intena = 0;
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+          // Process is done running for now.
+          // It should have changed its p->state before coming back.
+          c->proc = 0;
+          found = 1;
+        }
       }
       release(&p->lock);
-    }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
+      if (found)
+        break;
     }
   }
 }
